@@ -1,0 +1,558 @@
+/**
+ * Sheets.gs — 2枚構成:
+ *   当座勘定照合表 : 取引1件1行の明細
+ *   月次設定       : 月ごとの繰越金額/備考
+ * 1行目は日本語見出し、コード内部は英語キーの二層設計。
+ */
+
+const SHEET_STATEMENT    = '当座勘定照合表';
+const SHEET_MONTHLY      = '月次設定';
+const SHEET_UPLOAD_LOG   = 'アップロード履歴';
+const SHEET_COUNTERPARTY = '相手先マスタ';
+
+const STATEMENT_COLS = [
+  { key: 'id',            label: 'ID' },
+  { key: 'date',          label: '日付' },
+  { key: 'description',   label: '摘要' },
+  { key: 'counterparty',  label: '相手先' },
+  { key: 'check_number',  label: '手形小切手番号' },
+  { key: 'withdrawal',    label: 'お支払金額' },
+  { key: 'deposit',       label: 'お預り金額' },
+  { key: 'balance',       label: '残高(記載)' },
+  { key: 'bank',          label: '振込元銀行' },
+  { key: 'notes',         label: '備考' },
+  { key: 'source',        label: '元ファイル' },
+  { key: 'created_at',    label: '登録日時' },
+];
+const STATEMENT_HEADERS = STATEMENT_COLS.map(c => c.label);
+const STATEMENT_KEYS    = STATEMENT_COLS.map(c => c.key);
+
+const MONTHLY_COLS = [
+  { key: 'year_month',      label: '年月' },       // YYYY-MM
+  { key: 'opening_balance', label: '繰越金額' },
+  { key: 'notes',           label: '備考' },
+];
+const MONTHLY_HEADERS = MONTHLY_COLS.map(c => c.label);
+const MONTHLY_KEYS    = MONTHLY_COLS.map(c => c.key);
+
+const UPLOAD_LOG_COLS = [
+  { key: 'id',         label: 'ID' },
+  { key: 'timestamp',  label: '処理日時' },
+  { key: 'source',     label: '元ファイル' },
+  { key: 'method',     label: '取込経路' },
+  { key: 'status',     label: '結果' },
+  { key: 'rows',       label: '件数' },
+  { key: 'error',      label: 'エラー' },
+];
+const UPLOAD_LOG_HEADERS = UPLOAD_LOG_COLS.map(c => c.label);
+const UPLOAD_LOG_KEYS    = UPLOAD_LOG_COLS.map(c => c.key);
+
+const COUNTERPARTY_COLS = [
+  { key: 'name',     label: '相手先名' },
+  { key: 'aliases',  label: 'カナ別名' },  // 改行区切りで複数
+  { key: 'notes',    label: '備考' },
+];
+const COUNTERPARTY_HEADERS = COUNTERPARTY_COLS.map(c => c.label);
+const COUNTERPARTY_KEYS    = COUNTERPARTY_COLS.map(c => c.key);
+
+function _ss() { return SpreadsheetApp.getActiveSpreadsheet(); }
+
+function _getOrCreateStatementSheet() {
+  const ss = _ss();
+  let sh = ss.getSheetByName(SHEET_STATEMENT);
+  if (!sh) {
+    sh = ss.insertSheet(SHEET_STATEMENT);
+    sh.getRange(1, 1, 1, STATEMENT_HEADERS.length).setValues([STATEMENT_HEADERS]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    ['withdrawal','deposit','balance'].forEach(function (k) {
+      const col = STATEMENT_KEYS.indexOf(k) + 1;
+      sh.getRange(2, col, sh.getMaxRows() - 1, 1).setNumberFormat('#,##0');
+    });
+  }
+  return sh;
+}
+
+function _getOrCreateMonthlySheet() {
+  const ss = _ss();
+  let sh = ss.getSheetByName(SHEET_MONTHLY);
+  if (!sh) {
+    sh = ss.insertSheet(SHEET_MONTHLY);
+    sh.getRange(1, 1, 1, MONTHLY_HEADERS.length).setValues([MONTHLY_HEADERS]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    sh.getRange(2, MONTHLY_KEYS.indexOf('opening_balance') + 1, sh.getMaxRows() - 1, 1).setNumberFormat('#,##0');
+  }
+  return sh;
+}
+
+function _getOrCreateUploadLogSheet() {
+  const ss = _ss();
+  let sh = ss.getSheetByName(SHEET_UPLOAD_LOG);
+  if (!sh) {
+    sh = ss.insertSheet(SHEET_UPLOAD_LOG);
+    sh.getRange(1, 1, 1, UPLOAD_LOG_HEADERS.length).setValues([UPLOAD_LOG_HEADERS]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function _getOrCreateCounterpartySheet() {
+  const ss = _ss();
+  let sh = ss.getSheetByName(SHEET_COUNTERPARTY);
+  if (!sh) {
+    sh = ss.insertSheet(SHEET_COUNTERPARTY);
+    sh.getRange(1, 1, 1, COUNTERPARTY_HEADERS.length).setValues([COUNTERPARTY_HEADERS]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function initializeSheets() {
+  _getOrCreateStatementSheet();
+  _getOrCreateMonthlySheet();
+  _getOrCreateUploadLogSheet();
+  _getOrCreateCounterpartySheet();
+  return { ok: true };
+}
+
+function _rowsAsObjects(sheet, keys) {
+  const last = sheet.getLastRow();
+  if (last < 2) return [];
+  const values = sheet.getRange(2, 1, last - 1, keys.length).getValues();
+  return values.map(function (row) {
+    const obj = {};
+    keys.forEach(function (k, i) { obj[k] = row[i]; });
+    return obj;
+  }).filter(function (o) { return String(o[keys[0]]).length > 0; });
+}
+
+function _newId() { return Utilities.getUuid(); }
+
+/**
+ * OCR結果などから様々な日付形式を "YYYY-MM-DD" に正規化する。
+ * サポート: Date / "YYYY-MM-DD" / "YYYY/MM/DD" / "YYYY年M月D日" /
+ *          "令和X年M月D日" / "平成X年M月D日" / "R8.1.30" (和暦略記)。
+ * 変換できなければ空文字を返す。
+ */
+function _normalizeDate(input) {
+  if (!input) return '';
+  if (input instanceof Date) {
+    return Utilities.formatDate(input, 'Asia/Tokyo', 'yyyy-MM-dd');
+  }
+  let s = String(input).trim();
+  if (!s) return '';
+
+  // YYYY-MM-DD / YYYY/MM/DD
+  let m = s.match(/^(\d{4})[-\/\.](\d{1,2})[-\/\.](\d{1,2})/);
+  if (m) return m[1] + '-' + String(m[2]).padStart(2, '0') + '-' + String(m[3]).padStart(2, '0');
+
+  // YYYY年M月D日
+  m = s.match(/^(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日?/);
+  if (m) return m[1] + '-' + String(m[2]).padStart(2, '0') + '-' + String(m[3]).padStart(2, '0');
+
+  // 令和X年M月D日
+  m = s.match(/(?:令和|R|R\.?)\s*(\d{1,2})[年\.\/\-]\s*(\d{1,2})[月\.\/\-]\s*(\d{1,2})/);
+  if (m) {
+    const y = 2018 + Number(m[1]);  // 令和1年 = 2019年
+    return y + '-' + String(m[2]).padStart(2, '0') + '-' + String(m[3]).padStart(2, '0');
+  }
+  // 平成X年M月D日
+  m = s.match(/(?:平成|H|H\.?)\s*(\d{1,2})[年\.\/\-]\s*(\d{1,2})[月\.\/\-]\s*(\d{1,2})/);
+  if (m) {
+    const y = 1988 + Number(m[1]);
+    return y + '-' + String(m[2]).padStart(2, '0') + '-' + String(m[3]).padStart(2, '0');
+  }
+  return '';  // 不明
+}
+
+function _ymOf(dateStr) {
+  const d = _normalizeDate(dateStr);
+  return d ? d.slice(0, 7) : '';
+}
+
+/* ---------------- Statement ---------------- */
+
+function _rowFromFields(r, source) {
+  return [
+    _newId(),
+    _normalizeDate(r.date) || String(r.date || '').trim(),
+    String(r.description || '').trim(),
+    String(r.counterparty || '').trim(),
+    String(r.check_number || '').trim(),
+    Number(r.withdrawal) || 0,
+    Number(r.deposit) || 0,
+    Number(r.balance) || 0,
+    String(r.bank || '').trim(),
+    String(r.notes || '').trim(),
+    String(source || ''),
+    new Date(),
+  ];
+}
+
+function addStatementRows(rows, source) {
+  if (!Array.isArray(rows) || !rows.length) return { added: 0 };
+  const sh = _getOrCreateStatementSheet();
+  const values = rows.map(function (r) { return _rowFromFields(r, source); });
+  sh.getRange(sh.getLastRow() + 1, 1, values.length, STATEMENT_KEYS.length).setValues(values);
+  SpreadsheetApp.flush();
+  return { added: values.length };
+}
+
+/** 手動で1行追加 (UIの「+行追加」から) */
+function addStatementRowManual(fields) {
+  const sh = _getOrCreateStatementSheet();
+  const row = _rowFromFields(fields, '(手動入力)');
+  sh.appendRow(row);
+  SpreadsheetApp.flush();
+  return { ok: true, id: row[0] };
+}
+
+function listStatement() {
+  const sh = _getOrCreateStatementSheet();
+  const all = _rowsAsObjects(sh, STATEMENT_KEYS);
+  const rows = all.map(function (r) {
+    const dateStr = r.date instanceof Date
+      ? Utilities.formatDate(r.date, 'Asia/Tokyo', 'yyyy-MM-dd')
+      : String(r.date || '');
+    return {
+      id: String(r.id),
+      date: dateStr,
+      description: String(r.description || ''),
+      counterparty: String(r.counterparty || ''),
+      check_number: String(r.check_number || ''),
+      withdrawal: Number(r.withdrawal) || 0,
+      deposit: Number(r.deposit) || 0,
+      balance: Number(r.balance) || 0,
+      bank: String(r.bank || ''),
+      notes: String(r.notes || ''),
+      source: String(r.source || ''),
+      year_month: _ymOf(dateStr),
+    };
+  });
+  rows.sort(function (a, b) {
+    if (!a.date) return 1;
+    if (!b.date) return -1;
+    return a.date < b.date ? -1 : (a.date > b.date ? 1 : 0);
+  });
+  return rows;
+}
+
+function _findStatementRow(id) {
+  const sh = _getOrCreateStatementSheet();
+  const all = _rowsAsObjects(sh, STATEMENT_KEYS);
+  for (let i = 0; i < all.length; i++) {
+    if (String(all[i].id) === String(id)) return { rowIndex: i + 2, record: all[i], sheet: sh };
+  }
+  return null;
+}
+
+function updateStatementRow(id, fields) {
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(10000)) throw new Error('他の処理が実行中です');
+  try {
+    const found = _findStatementRow(id);
+    if (!found) throw new Error('行が見つかりません: ' + id);
+    const allowed = ['date','description','counterparty','check_number','withdrawal','deposit','balance','bank','notes'];
+    allowed.forEach(function (k) {
+      if (Object.prototype.hasOwnProperty.call(fields || {}, k)) {
+        const col = STATEMENT_KEYS.indexOf(k) + 1;
+        const v = (k === 'withdrawal' || k === 'deposit' || k === 'balance')
+          ? (Number(fields[k]) || 0)
+          : String(fields[k] == null ? '' : fields[k]);
+        found.sheet.getRange(found.rowIndex, col).setValue(v);
+      }
+    });
+    SpreadsheetApp.flush();
+    return { ok: true };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function deleteStatementRow(id) {
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(10000)) throw new Error('他の処理が実行中です');
+  try {
+    const found = _findStatementRow(id);
+    if (!found) throw new Error('行が見つかりません: ' + id);
+    found.sheet.deleteRow(found.rowIndex);
+    SpreadsheetApp.flush();
+    return { ok: true };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function clearStatement() {
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(10000)) throw new Error('他の処理が実行中です');
+  try {
+    const sh = _getOrCreateStatementSheet();
+    const last = sh.getLastRow();
+    if (last > 1) sh.deleteRows(2, last - 1);
+    SpreadsheetApp.flush();
+    return { ok: true };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/* ---------------- Monthly settings ---------------- */
+
+function listMonthly() {
+  const sh = _getOrCreateMonthlySheet();
+  return _rowsAsObjects(sh, MONTHLY_KEYS).map(function (r) {
+    return {
+      year_month: String(r.year_month || '').trim(),
+      opening_balance: Number(r.opening_balance) || 0,
+      notes: String(r.notes || ''),
+    };
+  });
+}
+
+function setOpeningBalance(yearMonth, amount, notes) {
+  const ym = String(yearMonth || '').trim();
+  if (!/^\d{4}-\d{2}$/.test(ym)) throw new Error('年月は YYYY-MM 形式で指定してください');
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(10000)) throw new Error('他の処理が実行中です');
+  try {
+    const sh = _getOrCreateMonthlySheet();
+    const rows = _rowsAsObjects(sh, MONTHLY_KEYS);
+    const amt = Number(amount) || 0;
+    const note = notes == null ? '' : String(notes);
+    for (let i = 0; i < rows.length; i++) {
+      if (String(rows[i].year_month) === ym) {
+        sh.getRange(i + 2, 1, 1, MONTHLY_KEYS.length).setValues([[ym, amt, note]]);
+        SpreadsheetApp.flush();
+        return { ok: true, updated: true };
+      }
+    }
+    sh.appendRow([ym, amt, note]);
+    SpreadsheetApp.flush();
+    return { ok: true, added: true };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function deleteMonthly(yearMonth) {
+  const ym = String(yearMonth || '').trim();
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(10000)) throw new Error('他の処理が実行中です');
+  try {
+    const sh = _getOrCreateMonthlySheet();
+    const rows = _rowsAsObjects(sh, MONTHLY_KEYS);
+    for (let i = 0; i < rows.length; i++) {
+      if (String(rows[i].year_month) === ym) {
+        sh.deleteRow(i + 2);
+        SpreadsheetApp.flush();
+        return { ok: true };
+      }
+    }
+    return { ok: true, note: 'not found' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/* ---------------- 月次集計 (照合表+月次設定を結合) ---------------- */
+
+/**
+ * 全ての年月サマリ。繰越+入金+出金+月末残高+件数を算出し、月を繋いで返す。
+ */
+function listMonthsSummary() {
+  const stmt = listStatement();
+  const monthly = listMonthly();
+  const openingByYm = {};
+  monthly.forEach(function (m) { openingByYm[m.year_month] = m.opening_balance; });
+
+  // 年月を統合して昇順
+  const ymSet = {};
+  stmt.forEach(function (r) { if (r.year_month) ymSet[r.year_month] = true; });
+  monthly.forEach(function (m) { if (m.year_month) ymSet[m.year_month] = true; });
+  const ymList = Object.keys(ymSet).sort();
+
+  // 各月のサマリを計算
+  const summaries = ymList.map(function (ym) {
+    const rows = stmt.filter(function (r) { return r.year_month === ym; });
+    const deposit = rows.reduce(function (a, r) { return a + (r.deposit || 0); }, 0);
+    const withdrawal = rows.reduce(function (a, r) { return a + (r.withdrawal || 0); }, 0);
+    const opening = Object.prototype.hasOwnProperty.call(openingByYm, ym)
+      ? openingByYm[ym] : null;
+    return {
+      year_month: ym,
+      opening_balance: opening,
+      deposit_total: deposit,
+      withdrawal_total: withdrawal,
+      closing_balance: (opening == null ? 0 : opening) + deposit - withdrawal,
+      transaction_count: rows.length,
+      opening_set: opening != null,
+    };
+  });
+  return summaries;
+}
+
+/**
+ * 1ヶ月分の詳細 (明細+各行の計算残高)。
+ */
+function getMonthlyData(yearMonth) {
+  const ym = String(yearMonth || '').trim();
+  const stmt = listStatement().filter(function (r) { return r.year_month === ym; });
+  const monthly = listMonthly().filter(function (m) { return m.year_month === ym; })[0];
+  const opening = monthly ? monthly.opening_balance : null;
+  let running = opening == null ? 0 : opening;
+  const withRunning = stmt.map(function (r) {
+    running = running + (r.deposit || 0) - (r.withdrawal || 0);
+    return Object.assign({}, r, { running_balance: running });
+  });
+  const deposit_total = stmt.reduce(function (a, r) { return a + (r.deposit || 0); }, 0);
+  const withdrawal_total = stmt.reduce(function (a, r) { return a + (r.withdrawal || 0); }, 0);
+  return {
+    year_month: ym,
+    opening_balance: opening,
+    opening_set: opening != null,
+    notes: monthly ? monthly.notes : '',
+    rows: withRunning,
+    deposit_total: deposit_total,
+    withdrawal_total: withdrawal_total,
+    closing_balance: (opening == null ? 0 : opening) + deposit_total - withdrawal_total,
+    transaction_count: stmt.length,
+  };
+}
+
+function getSpreadsheetUrl() { return _ss().getUrl(); }
+
+/* ---------------- 相手先マスタ ---------------- */
+
+function listCounterparties() {
+  const sh = _getOrCreateCounterpartySheet();
+  return _rowsAsObjects(sh, COUNTERPARTY_KEYS).map(function (r) {
+    return {
+      name: String(r.name || '').trim(),
+      aliases: String(r.aliases || '').split('\n').map(function (s) { return s.trim(); }).filter(Boolean),
+      notes: String(r.notes || ''),
+    };
+  });
+}
+
+/** 相手先を追加 or 更新 */
+function upsertCounterparty(name, aliases, notes) {
+  const n = String(name || '').trim();
+  if (!n) throw new Error('相手先名が必要です');
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(10000)) throw new Error('他の処理が実行中です');
+  try {
+    const sh = _getOrCreateCounterpartySheet();
+    const rows = _rowsAsObjects(sh, COUNTERPARTY_KEYS);
+    const aliasStr = Array.isArray(aliases) ? aliases.join('\n') : String(aliases || '');
+    const note = notes == null ? '' : String(notes);
+    for (let i = 0; i < rows.length; i++) {
+      if (String(rows[i].name).trim() === n) {
+        sh.getRange(i + 2, 1, 1, COUNTERPARTY_KEYS.length).setValues([[n, aliasStr, note]]);
+        SpreadsheetApp.flush();
+        return { ok: true, updated: true };
+      }
+    }
+    sh.appendRow([n, aliasStr, note]);
+    SpreadsheetApp.flush();
+    return { ok: true, added: true };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function deleteCounterparty(name) {
+  const n = String(name || '').trim();
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(10000)) throw new Error('他の処理が実行中です');
+  try {
+    const sh = _getOrCreateCounterpartySheet();
+    const rows = _rowsAsObjects(sh, COUNTERPARTY_KEYS);
+    for (let i = 0; i < rows.length; i++) {
+      if (String(rows[i].name).trim() === n) {
+        sh.deleteRow(i + 2);
+        SpreadsheetApp.flush();
+        return { ok: true };
+      }
+    }
+    return { ok: true, note: 'not found' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/* ---------------- アップロード履歴 ---------------- */
+
+const UPLOAD_LOG_MAX = 1000;
+
+function appendUploadLog(entry) {
+  const sh = _getOrCreateUploadLogSheet();
+  sh.appendRow([
+    _newId(),
+    new Date(),
+    String((entry && entry.source) || ''),
+    String((entry && entry.method) || ''),
+    String((entry && entry.status) || ''),
+    Number((entry && entry.rows) || 0),
+    String((entry && entry.error) || ''),
+  ]);
+  // サイズ上限: 上限を超えたら古い行から削除
+  const last = sh.getLastRow();
+  if (last > UPLOAD_LOG_MAX + 1) {
+    sh.deleteRows(2, last - UPLOAD_LOG_MAX - 1);
+  }
+}
+
+function listUploadLog(limit) {
+  const sh = _getOrCreateUploadLogSheet();
+  const all = _rowsAsObjects(sh, UPLOAD_LOG_KEYS);
+  const rows = all.map(function (r) {
+    return {
+      id: String(r.id),
+      timestamp: r.timestamp instanceof Date
+        ? Utilities.formatDate(r.timestamp, 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss')
+        : String(r.timestamp || ''),
+      source: String(r.source || ''),
+      method: String(r.method || ''),
+      status: String(r.status || ''),
+      rows: Number(r.rows) || 0,
+      error: String(r.error || ''),
+    };
+  });
+  rows.reverse();  // 新しい順
+  const n = Number(limit) || 50;
+  return rows.slice(0, n);
+}
+
+/* ---------------- 翌月への繰越コピー ---------------- */
+
+function _nextYm(ym) {
+  const m = String(ym).match(/^(\d{4})-(\d{2})$/);
+  if (!m) return '';
+  let y = Number(m[1]), mm = Number(m[2]);
+  mm++;
+  if (mm > 12) { y++; mm = 1; }
+  return y + '-' + String(mm).padStart(2, '0');
+}
+
+/**
+ * 指定月の月末残高を次月の繰越金額にコピー。
+ * 次月にすでに別値の繰越が設定されていれば force=true が必要。
+ */
+function propagateClosingToNext(yearMonth, force) {
+  const data = getMonthlyData(yearMonth);
+  if (!data.opening_set) throw new Error(yearMonth + ' の繰越金額がまだ未設定です');
+  const nextYm = _nextYm(yearMonth);
+  if (!nextYm) throw new Error('月フォーマット異常: ' + yearMonth);
+  const existing = listMonthly().filter(function (m) { return m.year_month === nextYm; })[0];
+  if (existing && existing.opening_balance !== data.closing_balance && !force) {
+    return {
+      ok: false,
+      conflict: true,
+      nextYm: nextYm,
+      proposed: data.closing_balance,
+      existing: existing.opening_balance,
+    };
+  }
+  setOpeningBalance(nextYm, data.closing_balance, yearMonth + ' の月末残高から自動繰越');
+  return { ok: true, nextYm: nextYm, opening: data.closing_balance, overwritten: !!existing };
+}
