@@ -1,0 +1,193 @@
+/**
+ * Drive.gs — 指定Driveフォルダから画像/PDFを取込み、Geminiで抽出した取引行を
+ * 当座勘定照合表シートに追記する。処理済ファイルは「処理済」サブフォルダへ、
+ * 失敗は「失敗」サブフォルダへ自動退避。
+ */
+
+const PROCESSED_SUBFOLDER_NAME = '処理済';
+const FAILED_SUBFOLDER_NAME = '失敗';
+const INGEST_MIMETYPES = [
+  'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif',
+  'application/pdf',
+];
+const DRIVE_FOLDER_PROP = 'INGEST_DRIVE_FOLDER_ID';
+
+/** 既定の取込先フォルダ (「入金データ」)。ScriptPropertiesで上書き可能。 */
+const DEFAULT_INGEST_FOLDER_ID = '1wTeVfK6e7TMcTFXHCxvk-nNweKdJ41jy';
+
+function getIngestFolderId() {
+  return PropertiesService.getScriptProperties().getProperty(DRIVE_FOLDER_PROP) || DEFAULT_INGEST_FOLDER_ID;
+}
+
+function setIngestFolderId(folderId) {
+  const id = String(folderId || '').trim();
+  if (!id) {
+    PropertiesService.getScriptProperties().deleteProperty(DRIVE_FOLDER_PROP);
+    return { ok: true, cleared: true };
+  }
+  DriveApp.getFolderById(id).getName();  // 存在確認
+  PropertiesService.getScriptProperties().setProperty(DRIVE_FOLDER_PROP, id);
+  return { ok: true, id: id };
+}
+
+function _getOrCreateSubfolder(parent, name) {
+  const it = parent.getFoldersByName(name);
+  if (it.hasNext()) return it.next();
+  return parent.createFolder(name);
+}
+
+function _listIngestibleFiles(folder) {
+  const files = folder.getFiles();
+  const out = [];
+  while (files.hasNext()) {
+    const f = files.next();
+    if (INGEST_MIMETYPES.indexOf(f.getMimeType()) >= 0) out.push(f);
+  }
+  return out;
+}
+
+/**
+ * Driveフォルダを走査し、各ファイルから取引行を抽出して照合表シートに追記。
+ */
+/** GAS実行時間の上限 (6分) 手前で切り上げる閾値 */
+const INGEST_TIME_BUDGET_MS = 5 * 60 * 1000;  // 5分
+
+function ingestDriveFolder(folderId) {
+  const id = String(folderId || getIngestFolderId() || '').trim();
+  if (!id) throw new Error('Driveフォルダが未設定です');
+
+  // 時間トリガとの同時実行を避ける (ロック取得失敗は明示エラー)
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(3000)) {
+    throw new Error('別の取込処理が実行中です。しばらく待って再試行してください');
+  }
+
+  try {
+    const folder = DriveApp.getFolderById(id);
+    const processedFolder = _getOrCreateSubfolder(folder, PROCESSED_SUBFOLDER_NAME);
+    const failedFolder = _getOrCreateSubfolder(folder, FAILED_SUBFOLDER_NAME);
+    const files = _listIngestibleFiles(folder);
+
+    let totalRows = 0;
+    let remaining = 0;
+    const results = [];
+    const startedAt = Date.now();
+
+    for (let i = 0; i < files.length; i++) {
+      // 時間切れ検出: 残りファイルはフォルダに残したまま次回へ
+      if (Date.now() - startedAt > INGEST_TIME_BUDGET_MS) {
+        remaining = files.length - i;
+        break;
+      }
+      const f = files[i];
+      const fileName = f.getName();
+      try {
+        const blob = f.getBlob();
+        const mime = f.getMimeType();
+        const base64 = Utilities.base64Encode(blob.getBytes());
+        const raw = extractStatementRows(base64, mime);
+        const rows = _normalizeExtractedRows(raw);
+        addStatementRows(rows, fileName);
+        totalRows += rows.length;
+        f.moveTo(processedFolder);
+        results.push({ file: fileName, ok: true, added: rows.length });
+        appendUploadLog({ source: fileName, method: 'Drive', status: '成功', rows: rows.length });
+      } catch (e) {
+        try { f.moveTo(failedFolder); } catch (_) {}
+        const msg = String((e && e.message) || e);
+        results.push({ file: fileName, ok: false, error: msg });
+        appendUploadLog({ source: fileName, method: 'Drive', status: '失敗', error: msg });
+      }
+    }
+
+    return {
+      folderId: id,
+      folderName: folder.getName(),
+      scanned: files.length,
+      processed: files.length - remaining,
+      remaining: remaining,
+      addedRows: totalRows,
+      results: results,
+    };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/* ---- 失敗フォルダの一覧と再処理 ---- */
+
+function listFailedFiles() {
+  const id = getIngestFolderId();
+  if (!id) return [];
+  const parent = DriveApp.getFolderById(id);
+  const failedFolder = _getOrCreateSubfolder(parent, FAILED_SUBFOLDER_NAME);
+  const files = failedFolder.getFiles();
+  const out = [];
+  while (files.hasNext()) {
+    const f = files.next();
+    out.push({ id: f.getId(), name: f.getName(), mime: f.getMimeType(), size: f.getSize() });
+  }
+  return out;
+}
+
+function retryFailedFile(fileId) {
+  const id = getIngestFolderId();
+  if (!id) throw new Error('Driveフォルダが未設定です');
+  const parent = DriveApp.getFolderById(id);
+  const processed = _getOrCreateSubfolder(parent, PROCESSED_SUBFOLDER_NAME);
+  const failed = _getOrCreateSubfolder(parent, FAILED_SUBFOLDER_NAME);
+  const f = DriveApp.getFileById(fileId);
+  const fileName = f.getName();
+  try {
+    const blob = f.getBlob();
+    const mime = f.getMimeType();
+    const base64 = Utilities.base64Encode(blob.getBytes());
+    const raw = extractStatementRows(base64, mime);
+    const rows = _normalizeExtractedRows(raw);
+    addStatementRows(rows, fileName);
+    f.moveTo(processed);
+    appendUploadLog({ source: fileName, method: 'Drive(再処理)', status: '成功', rows: rows.length });
+    return { ok: true, added: rows.length };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    appendUploadLog({ source: fileName, method: 'Drive(再処理)', status: '失敗', error: msg });
+    throw e;
+  }
+}
+
+/* ---- 自動取込トリガ ---- */
+
+const TRIGGER_HANDLER = 'triggerDriveIngest';
+
+function triggerDriveIngest() {
+  const id = getIngestFolderId();
+  if (!id) return;
+  try { ingestDriveFolder(id); } catch (e) { console.error('auto ingest failed:', e); }
+}
+
+function enableAutoIngestTrigger(minutesEvery) {
+  disableAutoIngestTrigger();
+  const m = Math.max(1, Number(minutesEvery) || 15);
+  ScriptApp.newTrigger(TRIGGER_HANDLER).timeBased().everyMinutes(m).create();
+  return { ok: true, everyMinutes: m };
+}
+
+function disableAutoIngestTrigger() {
+  const triggers = ScriptApp.getProjectTriggers();
+  let removed = 0;
+  triggers.forEach(function (t) {
+    if (t.getHandlerFunction() === TRIGGER_HANDLER) {
+      ScriptApp.deleteTrigger(t);
+      removed++;
+    }
+  });
+  return { ok: true, removed: removed };
+}
+
+function getAutoIngestTriggerStatus() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === TRIGGER_HANDLER) return { enabled: true };
+  }
+  return { enabled: false };
+}
