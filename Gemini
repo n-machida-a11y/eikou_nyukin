@@ -1,0 +1,118 @@
+/**
+ * Gemini.gs — 銀行の入出金通知(画像/PDF)から全取引行を抽出する。
+ * 「振込入金」に限らず、電気料金・手数料・小切手・手形・振込支払など
+ * すべての行を抽出し、当座勘定照合表フォーマットに正規化する。
+ *
+ * ScriptProperties:
+ *   GEMINI_API_KEY — 必須
+ *   GEMINI_MODEL   — 任意 (既定: gemini-2.5-flash)
+ */
+
+function _geminiApiKey() {
+  const key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!key) throw new Error('ScriptPropertiesに GEMINI_API_KEY が未設定です');
+  return key;
+}
+
+function _geminiModel() {
+  return PropertiesService.getScriptProperties().getProperty('GEMINI_MODEL') || 'gemini-2.5-flash';
+}
+
+function _geminiCall(parts, opts) {
+  const model = (opts && opts.model) || _geminiModel();
+  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent';
+  const body = {
+    contents: [{ role: 'user', parts: parts }],
+    generationConfig: Object.assign({
+      temperature: 0.0,
+      responseMimeType: 'application/json',
+    }, (opts && opts.generationConfig) || {}),
+  };
+  const res = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'x-goog-api-key': _geminiApiKey() },
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true,
+  });
+  const code = res.getResponseCode();
+  const text = res.getContentText();
+  if (code >= 300) throw new Error('Gemini API error ' + code + ': ' + text);
+  const parsed = JSON.parse(text);
+  const cand = parsed.candidates && parsed.candidates[0];
+  if (!cand) throw new Error('Gemini: no candidates returned');
+  const out = cand.content && cand.content.parts && cand.content.parts.map(function (p) { return p.text; }).join('');
+  if (!out) throw new Error('Gemini: empty response');
+  return out;
+}
+
+/**
+ * 画像/PDF から取引行を抽出する。
+ * @param {string} base64 — data URL prefix を含まない base64
+ * @param {string} mimeType — image/jpeg, image/png, application/pdf など
+ * @returns {Array<{date, description, counterparty, check_number, withdrawal, deposit, balance, bank}>}
+ */
+function extractStatementRows(base64, mimeType) {
+  const prompt = [
+    'あなたは銀行の入出金通知書を読み取るアシスタントです。',
+    '入力は「入出金のご案内」「お取引のご案内」「当座勘定照合表」いずれかの画像または複数ページPDFです。',
+    '画像/PDF 全体から、取引1行につき1レコードずつJSONで抽出してください。',
+    '振込入金だけでなく、電気料金・電話料金・リース料・手数料・小切手・手形・振込支払・引落も含めて、全ての取引行を漏れなく抽出します。',
+    '',
+    '出力は JSON 配列のみ (前置き・マークダウン・コメント禁止)。各要素のキー:',
+    '  date         : "YYYY-MM-DD" (和暦/省略は令和として西暦に変換。日付不明なら空文字)',
+    '  description  : 摘要 (例: "振込入金", "電気料金", "小切手", "手形", "手数料")',
+    '  counterparty : 相手先/振込人/振込先 (読み取れればカナそのまま、なければ空文字)',
+    '  check_number : 手形・小切手番号 (なければ空文字)',
+    '  withdrawal   : お支払金額 (出金、数値。カンマ・円記号なし。出金でなければ 0)',
+    '  deposit      : お預り金額 (入金、数値。入金でなければ 0)',
+    '  balance      : その取引後の差引残高 (通知に記載があれば数値。なければ 0)',
+    '  bank         : 振込元銀行(読み取れなければ空文字)',
+    '',
+    '取引が1件もない場合は空配列 [] を返してください。',
+  ].join('\n');
+
+  const raw = _geminiCall([
+    { text: prompt },
+    { inline_data: { mime_type: mimeType || 'image/jpeg', data: base64 } },
+  ]);
+  return _parseJsonLoose(raw);
+}
+
+function _parseJsonLoose(text) {
+  let t = String(text || '').trim();
+  t = t.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+  try { return JSON.parse(t); }
+  catch (e) {
+    const m = t.match(/[\[{][\s\S]*[\]}]/);
+    if (m) return JSON.parse(m[0]);
+    throw new Error('Gemini JSON parse failed: ' + t);
+  }
+}
+
+function _normalizeExtractedRows(raw) {
+  let rows = raw;
+  if (rows && !Array.isArray(rows)) {
+    if (Array.isArray(rows.rows)) rows = rows.rows;
+    else if (Array.isArray(rows.transactions)) rows = rows.transactions;
+    else if (Array.isArray(rows.items)) rows = rows.items;
+    else rows = [];
+  }
+  if (!Array.isArray(rows)) rows = [];
+  function num(v) { return Number(String(v == null ? '' : v).replace(/[^\d.-]/g, '')) || 0; }
+  return rows.map(function (r) {
+    return {
+      date: String((r && r.date) || '').trim(),
+      description: String((r && r.description) || '').trim(),
+      counterparty: String((r && r.counterparty) || '').trim(),
+      check_number: String((r && r.check_number) || '').trim(),
+      withdrawal: num(r && r.withdrawal),
+      deposit: num(r && r.deposit),
+      balance: num(r && r.balance),
+      bank: String((r && r.bank) || '').trim(),
+    };
+  }).filter(function (r) {
+    // 日付も金額も取れてない空行は捨てる
+    return r.date || r.withdrawal || r.deposit || r.description;
+  });
+}
